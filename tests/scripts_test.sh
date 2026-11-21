@@ -7,7 +7,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REAL_BIN="$(realpath "${1:?usage: scripts_test.sh path/to/omessaged}")"
 T=$(mktemp -d)
-trap 'pkill -u "$(id -u)" -f "$T/" 2>/dev/null; rm -rf "$T"' EXIT
+DECOY_DIR=$(mktemp -d)
+trap 'pkill -u "$(id -u)" -f "$T/" 2>/dev/null; if [[ -n ${DECOY_PID:-} ]]; then kill -KILL "$DECOY_PID" 2>/dev/null || true; fi; rm -rf "$T" "$DECOY_DIR"' EXIT
 fails=0
 
 ok() { printf 'ok   %s\n' "$1"; }
@@ -82,6 +83,19 @@ check "install: edited unit is backed up" "grep -q EDITED $UNIT.bak-* && ! grep 
 check "install: points to drop-ins" "[[ \$out == *'systemctl --user edit omessaged'* ]]"
 
 # --- uninstall.sh
+# A helper outside this test prefix must not be stopped (a live desktop
+# install is one such process). Start it before any uninstall.sh run.
+mkdir -p "$DECOY_DIR/bin" "$DECOY_DIR/home" "$DECOY_DIR/run"
+chmod 700 "$DECOY_DIR/run"
+cp "$REAL_BIN" "$DECOY_DIR/bin/omessaged"
+chmod +x "$DECOY_DIR/bin/omessaged"
+env -i PATH="/usr/bin:/bin" HOME="$DECOY_DIR/home" XDG_RUNTIME_DIR="$DECOY_DIR/run" \
+  "$DECOY_DIR/bin/omessaged" daemon >"$DECOY_DIR/daemon.log" 2>&1 &
+DECOY_PID=$!
+for _ in $(seq 1 40); do [[ -S $DECOY_DIR/run/omessage/omessaged.sock ]] && break; sleep 0.25; done
+check "uninstall: decoy daemon started" "kill -0 $DECOY_PID && [[ -S $DECOY_DIR/run/omessage/omessaged.sock ]]"
+decoy_alive() { kill -0 "$DECOY_PID" && [[ -S $DECOY_DIR/run/omessage/omessaged.sock ]]; }
+
 mkdir -p "$T/home/.local/share/omessage"
 echo data >"$T/home/.local/share/omessage/marker"
 
@@ -91,6 +105,7 @@ out=$(run_env bash "$ROOT/uninstall.sh" --purge --yes 2>&1)
 rc=$?
 check "uninstall: service that won't stop fails" "[[ $rc -ne 0 && \$out == *'still running'* ]]"
 check "uninstall: nothing removed when stop fails" "[[ -x $INSTALLED && -f $UNIT && -f $T/home/.local/share/omessage/marker ]]"
+check "uninstall: stop-fail leaves outside daemon running" "decoy_alive"
 
 # A real daemon outside systemd must be found and stopped before removal.
 rm -f "$T/stop-fails"
@@ -103,10 +118,12 @@ rc=$?
 check "uninstall: stops a stray daemon and succeeds" "[[ $rc -eq 0 ]] && ! pgrep -u $(id -u) -f '$INSTALLED daemon' >/dev/null"
 check "uninstall: removes helper and unit" "[[ ! -e $INSTALLED && ! -e $UNIT ]]"
 check "uninstall: keeps identity without --purge" "[[ -f $T/home/.local/share/omessage/marker ]]"
+check "uninstall: leaves a daemon outside the prefix running" "decoy_alive"
 
 run_env bash "$ROOT/uninstall.sh" --purge --yes >/dev/null 2>&1
 rc=$?
 check "uninstall --purge --yes deletes data" "[[ $rc -eq 0 && ! -e $T/home/.local/share/omessage ]]"
+check "uninstall: purge also leaves the outside daemon running" "decoy_alive"
 
 echo
 if ((fails)); then

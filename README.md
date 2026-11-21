@@ -237,10 +237,13 @@ own: put its `wss://` URL first in `inbox_relays`.
 omarchy plugin remove io.github.omarchy-omessage.omessage
 ```
 
-`uninstall.sh` stops and disables the service, checks that no `omessaged daemon`
-process is left running (and stops it if one is), then removes the unit file
-and the helper binary. If the helper can't be stopped, it removes nothing and
-exits with an error. Your identity and messages stay in `~/.local/share/omessage`.
+`uninstall.sh` stops and disables the service, then checks that this
+installation's helper (`~/.local/share/omessage/bin/omessaged daemon`) is not
+still running, and stops it if it is. Helpers started from another path,
+including a desktop install while the script tests below are running, are left
+alone. If this installation's helper can't be stopped, nothing is removed and
+the script exits with an error. Your identity and messages stay in
+`~/.local/share/omessage`.
 Run `uninstall.sh --purge` to delete them too (it asks first; add `--yes` to
 skip the question). Back up your key before purging if you may want this
 identity again.

@@ -9,6 +9,7 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 UNIT="$CONFIG_HOME/systemd/user/omessaged.service"
+TARGET_BIN="$DATA_HOME/omessage/bin/omessaged"
 PURGE=0
 ASSUME_YES=0
 for arg in "$@"; do
@@ -29,13 +30,23 @@ done
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() { printf 'omessage uninstall: %s\n' "$*" >&2; exit 1; }
 
-# PIDs of this user's `omessaged daemon` processes, wherever the binary is
-# (including one whose file was already deleted).
+# PIDs of `omessaged daemon` processes running this installation's helper
+# (including one whose file was already deleted). Helpers started from
+# another path, such as a test copy or a local build, are left alone.
 daemon_pids() {
-  local pid argv
+  local pid argv exe target
+  target=$TARGET_BIN
+  if [[ -e $target ]]; then
+    target=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
+  fi
   for pid in $(pgrep -u "$(id -u)" -x omessaged 2>/dev/null || true); do
     mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || continue
-    [[ ${argv[1]:-} == daemon ]] && printf '%s\n' "$pid"
+    [[ ${argv[1]:-} == daemon ]] || continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    exe=${exe% (deleted)}
+    if [[ $exe == "$target" || $exe == "$TARGET_BIN" || ${argv[0]} == "$TARGET_BIN" || ${argv[0]} == "$target" ]]; then
+      printf '%s\n' "$pid"
+    fi
   done
   return 0
 }
