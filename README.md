@@ -34,8 +34,8 @@ sign-up, phone number or email, and no server of ours in the middle.
 
 ## Install
 
-Requirements: Omarchy with the Quattro shell, plus a systemd user session,
-`notify-send`, `curl` and `wl-copy`. These all ship with Omarchy.
+Requirements: Omarchy with the Quattro shell, plus a systemd user session, a
+notification daemon (D-Bus), `curl` and `wl-copy`. These all ship with Omarchy.
 
 **1. Add the plugin:**
 
@@ -61,19 +61,32 @@ Pick one option:
   [latest release](https://github.com/Omarchy-Omessage/omarchy-omessage/releases/latest):
 
   ```bash
-  cd /tmp
-  curl -fLO https://github.com/Omarchy-Omessage/omarchy-omessage/releases/latest/download/omessaged-x86_64-linux
-  curl -fLO https://github.com/Omarchy-Omessage/omarchy-omessage/releases/latest/download/omessaged-x86_64-linux.sha256
-  sha256sum -c omessaged-x86_64-linux.sha256
-  chmod +x omessaged-x86_64-linux
-  OMESSAGE_HELPER_BIN=/tmp/omessaged-x86_64-linux \
-    ~/.config/omarchy/plugins/io.github.omarchy-omessage.omessage/install.sh
+  (
+    set -euo pipefail
+    cd "$(mktemp -d)"
+    url=https://github.com/Omarchy-Omessage/omarchy-omessage/releases/latest/download
+    curl -fLO "$url/omessaged-x86_64-linux"
+    curl -fLO "$url/omessaged-x86_64-linux.sha256"
+    sha256sum -c omessaged-x86_64-linux.sha256
+    OMESSAGE_HELPER_BIN="$PWD/omessaged-x86_64-linux" \
+    OMESSAGE_HELPER_SHA256="$(cut -d' ' -f1 omessaged-x86_64-linux.sha256)" \
+      ~/.config/omarchy/plugins/io.github.omarchy-omessage.omessage/install.sh
+  )
   ```
+
+  Everything stops at the first failed step. `install.sh` checks the binary
+  against `OMESSAGE_HELPER_SHA256` again and refuses a mismatch, and it makes
+  sure the binary runs before it touches the installed helper or the service.
 
 `install.sh` copies the helper to `~/.local/share/omessage/bin/`, installs and
 starts the `omessaged` user service, and prints your npub. No sudo is needed,
 and it doesn't change any Omarchy configuration. After `omarchy plugin update`,
 run `install.sh` again to update the helper.
+
+The unit file is regenerated on every install. To customize the service, use
+a drop-in (`systemctl --user edit omessaged`), which survives reinstalls. If
+the unit file itself was edited, `install.sh` saves it as
+`omessaged.service.bak-<date>` before replacing it.
 
 ## Usage
 
@@ -111,12 +124,18 @@ send as you. To restore on a fresh install, stop the service and run
 
 ```
 omessaged id                                 your npub
-omessaged send <npub|nip05> <text>           send a message
+omessaged send <npub|nip05> < message.txt    send a message (text on stdin)
 omessaged add <npub|nip05> [name]            add a contact
 omessaged accept|block|unblock|delete <npub>
 omessaged retry <message-id>                 resend a failed message
 omessaged snapshot                           JSON state
+omessaged rpc                                one JSON request on stdin
 ```
+
+Message text is only accepted on stdin (`echo 'hi' | omessaged send <npub>`),
+because other local users can read every process's arguments. To keep the
+recipient out of the process list too, send a request through `rpc`, as the
+panel does: `echo '{"cmd":"send","to":"npub1…","text":"hi"}' | omessaged rpc`.
 
 ### Relays
 
@@ -135,7 +154,10 @@ Relays are set in `~/.config/omessage/config.json`:
 clients know where to deliver to you. Outgoing messages go to the recipient's
 kind 10050 relays, then their NIP-65 read relays, then your own relays. A copy
 of each message is also wrapped to you and kept on your inbox relays. Restart
-the service after editing (`systemctl --user restart omessaged`).
+the service after editing (`systemctl --user restart omessaged`). If the file
+can't be read or isn't valid JSON, the service refuses to start (see
+`journalctl --user -u omessaged`) rather than falling back to the defaults;
+the file is only created when it doesn't exist.
 
 A self-hosted, always-on Omessage relay is planned. You can already run your
 own: put its `wss://` URL first in `inbox_relays`.
@@ -148,9 +170,25 @@ own: put its `wss://` URL first in `inbox_relays`.
   and roughly how large it is. Your kind 10050 inbox relay list is public.
   Omessage publishes only that list and gift-wrapped DMs; it never posts
   public notes.
+- **Relay authentication (NIP-42).** Your key answers AUTH only on the
+  connections to your own relays (`inbox_relays` and `relays`), which only
+  read messages addressed to you and store your own copies. Each message you
+  send goes out on a fresh connection; if a relay asks it to authenticate, it
+  uses a throwaway key, so the relay can't tie the wrap or its recipient to
+  your key. Lookups (profiles, relay lists) use connections that never
+  authenticate. Your own copy of a sent message is stored 5–60 seconds later,
+  so a relay can't pair the two wraps by timing alone. A relay that sees all
+  of these connections can still link them by IP address; use a VPN or Tor if
+  that matters to you.
 - **Other lookups.** Profiles of your accepted contacts are fetched from
   relays, and NIP-05 addresses are looked up with `curl` on the address's own
-  domain.
+  domain (no `~/.curlrc`, no redirects).
+- **Process list.** Message text, contacts and NIP-05 addresses never appear
+  in command-line arguments: the panel sends requests to the helper on stdin,
+  notifications go straight to the desktop's D-Bus notification service, and
+  the NIP-05 URL is passed to `curl` on stdin. Notifications for accepted
+  contacts show the message text; set `"notifications": false` to turn them
+  off.
 - **Your key** is stored unencrypted (hex) in
   `~/.local/share/omessage/identity.key` with mode `0600`, next to the message
   database (also `0600`). Anyone with access to your user account can read
@@ -168,20 +206,20 @@ own: put its `wss://` URL first in `inbox_relays`.
 ## How it works
 
 ```
- Omarchy shell (QML plugin)  ──omessaged watch / send──▶  omessaged (systemd --user)
+ Omarchy shell (QML plugin)  ──omessaged watch / rpc───▶  omessaged (systemd --user)
    BarWidget.qml, Panel.qml        unix socket in            keys · relays · NIP-17
-                                   $XDG_RUNTIME_DIR           SQLite · notify-send
+                                   $XDG_RUNTIME_DIR           SQLite · D-Bus
                                                                    │
                                                           wss:// Nostr relays
 ```
 
 - **Plugin** (`BarWidget.qml`, `Panel.qml`, `Model.js`): a `bar-widget` with a
   built-in chat panel. It runs no network code itself: it streams state from
-  `omessaged watch` and runs `omessaged <command>` to act.
+  `omessaged watch` and sends each action to `omessaged rpc` as JSON on stdin.
 - **Helper** (`helper/`, Rust, [nostr-sdk](https://crates.io/crates/nostr-sdk)):
   keeps relay connections, unwraps incoming gift wraps, stores messages in
-  SQLite, publishes your inbox relay list and sends notifications through
-  `notify-send`.
+  SQLite, publishes your inbox relay list and sends desktop notifications over
+  D-Bus.
 
 | Path | What |
 |------|------|
@@ -199,8 +237,10 @@ own: put its `wss://` URL first in `inbox_relays`.
 omarchy plugin remove io.github.omarchy-omessage.omessage
 ```
 
-`uninstall.sh` stops and disables the service and removes the unit file and the
-helper binary. Your identity and messages stay in `~/.local/share/omessage`.
+`uninstall.sh` stops and disables the service, checks that no `omessaged daemon`
+process is left running (and stops it if one is), then removes the unit file
+and the helper binary. If the helper can't be stopped, it removes nothing and
+exits with an error. Your identity and messages stay in `~/.local/share/omessage`.
 Run `uninstall.sh --purge` to delete them too (it asks first; add `--yes` to
 skip the question). Back up your key before purging if you may want this
 identity again.
@@ -213,11 +253,12 @@ From the plugin directory (or a checkout of this repository):
 cd helper
 cargo build --release --locked     # Rust 1.89+
 cargo test --release --locked
+cd .. && tests/scripts_test.sh helper/target/release/omessaged   # install/uninstall tests
 ```
 
 `install.sh` does the same build in `~/.cache/omessage/target` and installs the
 result. Cargo fetches the crates pinned in `helper/Cargo.lock` (nostr-sdk,
-rusqlite with bundled SQLite, tokio, serde).
+rusqlite with bundled SQLite, tokio, serde, zbus).
 
 ## Limitations
 

@@ -8,7 +8,8 @@ import "Model.js" as Model
 
 // Omessage chat panel. Talks to the omessaged helper (installed by
 // install.sh as a systemd --user service): `omessaged watch` streams JSON
-// snapshots, and one-shot `omessaged <cmd>` calls perform actions.
+// snapshots, and actions go to `omessaged rpc` as one JSON line on stdin, so
+// message text and contacts never appear in any process's arguments.
 Panel {
   id: root
   moduleName: "io.github.omarchy-omessage.omessage"
@@ -150,10 +151,16 @@ Panel {
   // ---- one-shot actions, run one at a time
   property var queue: []
 
-  function run(args, done) {
+  // `req` is a request object for the service ({cmd: "send", ...}); it is
+  // written to `omessaged rpc` on stdin. `args` runs a local helper command
+  // whose arguments carry nothing private (export-key).
+  function call(req, done) { enqueue({ req: req, args: [root.helperBin, "rpc"], done: done || null }) }
+  function runLocal(args, done) { enqueue({ req: null, args: [root.helperBin].concat(args), done: done || null }) }
+
+  function enqueue(job) {
     if (!root.installed) { flash("Omessage helper is not installed", true); return }
     var q = root.queue.slice()
-    q.push({ args: [root.helperBin].concat(args), done: done || null })
+    q.push(job)
     root.queue = q
     if (!actionProc.running) runNext()
   }
@@ -170,6 +177,12 @@ Panel {
   Process {
     id: actionProc
     property var current: null
+    stdinEnabled: true
+    onStarted: {
+      // One line of JSON; the helper reads up to the newline.
+      if (actionProc.current && actionProc.current.req)
+        actionProc.write(JSON.stringify(actionProc.current.req) + "\n")
+    }
     stdout: StdioCollector {
       id: actionOut
       waitForEnd: true
@@ -203,42 +216,42 @@ Panel {
   }
 
   function markSelectedRead() {
-    if (root.selected && root.selected.unread > 0) run(["read", root.selected.peer])
+    if (root.selected && root.selected.unread > 0) call({ cmd: "read", who: root.selected.peer })
   }
 
   function markAllRead() {
     for (var i = 0; i < root.conversations.length; i++)
-      if (root.conversations[i].unread > 0) run(["read", root.conversations[i].peer])
+      if (root.conversations[i].unread > 0) call({ cmd: "read", who: root.conversations[i].peer })
   }
 
   function send(text) {
     var body = String(text || "")
     if (body.trim() === "" || !root.selected) return false
     var peer = root.selected.peer
-    run(["send", peer, body], function(result) {
+    call({ cmd: "send", to: peer, text: body }, function(result) {
       if (result.status === "failed") root.flash("Not delivered: no relay accepted the message", true)
     })
     return true
   }
 
   function acceptRequest(peer) {
-    run(["accept", peer], function(result) {
+    call({ cmd: "accept", who: peer }, function(result) {
       if (result.ok) root.flash("Accepted. You can reply now.", false)
     })
   }
 
   function blockSender(peer) {
-    run(["block", peer], function(result) {
+    call({ cmd: "block", who: peer }, function(result) {
       if (result.ok) root.flash("Blocked. Their messages will be dropped (unblock: omessaged unblock <npub>).", false)
     })
   }
 
   function deleteConversation(peer) {
-    run(["delete", peer])
+    call({ cmd: "delete", who: peer })
   }
 
   function retry(id) {
-    run(["retry", id], function(result) {
+    call({ cmd: "retry", id: id }, function(result) {
       if (result.status === "failed") root.flash("Still not delivered: no relay accepted the message", true)
     })
   }
@@ -253,9 +266,9 @@ Panel {
     var target = String(who || "").trim()
     if (target === "") return
     root.flash("Looking up " + target + "…", false)
-    var args = ["add", target]
-    if (String(name || "").trim() !== "") args.push(String(name).trim())
-    run(args, function(result) {
+    var req = { cmd: "add", who: target }
+    if (String(name || "").trim() !== "") req.name = String(name).trim()
+    call(req, function(result) {
       if (result.ok) {
         root.flash("", false)
         root.select(result.npub)
@@ -278,7 +291,7 @@ Panel {
       return
     }
     root.confirmBackup = false
-    run(["export-key"], function(result) {
+    runLocal(["export-key"], function(result) {
       if (result.ok) flash("Secret key saved to " + result.path + " (mode 600). Anyone with it can read your messages.", false)
     })
   }

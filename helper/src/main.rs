@@ -4,7 +4,10 @@
 //!   omessaged daemon                    run the service (systemd --user)
 //!   omessaged watch                     stream JSON snapshots (used by the panel)
 //!   omessaged snapshot                  print one JSON snapshot
-//!   omessaged send <who> <text…>        send a NIP-17 private message
+//!   omessaged send <who>                send a NIP-17 private message read from stdin
+//!   omessaged rpc                       read one JSON request from stdin and send it
+//!                                       to the service (used by the panel, so message
+//!                                       text and contacts never appear in argv)
 //!   omessaged retry <message-id>        send a failed message again
 //!   omessaged add <who> [name]          add a contact (npub, hex or NIP-05)
 //!   omessaged rename <who> <name>       set a contact nickname
@@ -33,7 +36,7 @@ use tokio::net::UnixStream;
 
 fn usage() -> ! {
     eprintln!(
-        "omessaged {}\nusage: omessaged daemon|watch|snapshot|send <who> <text>|retry <id>|add <who> [name]|rename <who> <name>|read <who>|delete <who>|accept <who>|block <who>|unblock <who>|id|export-key [--out PATH|--stdout]|import-key",
+        "omessaged {}\nusage: omessaged daemon|watch|snapshot|rpc|send <who> (message on stdin)|retry <id>|add <who> [name]|rename <who> <name>|read <who>|delete <who>|accept <who>|block <who>|unblock <who>|id|export-key [--out PATH|--stdout]|import-key",
         env!("CARGO_PKG_VERSION")
     );
     std::process::exit(2)
@@ -62,10 +65,18 @@ async fn run(cmd: &str, rest: &[String]) -> anyhow::Result<i32> {
         "watch" => watch().await,
         "snapshot" | "status" => request(json!({"cmd": "snapshot"})).await,
         "send" => {
-            if rest.len() < 2 {
-                usage()
+            // The text comes from stdin, never argv: other local users can
+            // read every process's arguments.
+            let Some(to) = rest.first() else { usage() };
+            if rest.len() > 1 {
+                anyhow::bail!("pass the message on stdin, not as an argument: echo 'hi' | omessaged send <who>");
             }
-            request(json!({"cmd": "send", "to": rest[0], "text": rest[1..].join(" ")})).await
+            let text = read_stdin(MAX_STDIN_BYTES, false).await?;
+            request(json!({"cmd": "send", "to": to, "text": text})).await
+        }
+        "rpc" => {
+            let line = read_stdin(MAX_STDIN_BYTES, true).await?;
+            request(parse_rpc(&line)?).await
         }
         "retry" => {
             let Some(id) = rest.first() else { usage() };
@@ -128,6 +139,44 @@ fn export_key(rest: &[String]) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// Largest stdin payload `send` and `rpc` accept (the service caps
+/// messages at 16 KiB; JSON escaping can roughly double that).
+const MAX_STDIN_BYTES: u64 = 64 * 1024;
+
+/// Read stdin up to `max` bytes: the first line if `one_line`, else all of
+/// it. Gives up after 10 s, so a caller that never writes can't hang us.
+async fn read_stdin(max: u64, one_line: bool) -> anyhow::Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut input = tokio::io::stdin().take(max + 1);
+    let read = async {
+        let mut buf = Vec::new();
+        if one_line {
+            BufReader::new(&mut input).read_until(b'\n', &mut buf).await?;
+        } else {
+            input.read_to_end(&mut buf).await?;
+        }
+        anyhow::Ok(buf)
+    };
+    let buf = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out reading stdin"))??;
+    if buf.len() as u64 > max {
+        anyhow::bail!("input is too long");
+    }
+    Ok(String::from_utf8(buf)?)
+}
+
+/// Check one panel request: a JSON object with a `cmd` the service runs
+/// once (not `watch`, which streams).
+fn parse_rpc(line: &str) -> anyhow::Result<Value> {
+    let req: Value = serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("bad request: {e}"))?;
+    match req["cmd"].as_str() {
+        Some("watch") | None => anyhow::bail!("bad request: missing or unsupported cmd"),
+        Some(_) if req.is_object() => Ok(req),
+        Some(_) => anyhow::bail!("bad request"),
+    }
+}
+
 async fn request(req: Value) -> anyhow::Result<i32> {
     let stream = UnixStream::connect(paths::socket_path())
         .await
@@ -170,5 +219,20 @@ async fn watch() -> anyhow::Result<i32> {
             }
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_accepts_one_shot_commands_only() {
+        let req = parse_rpc("{\"cmd\":\"send\",\"to\":\"npub1x\",\"text\":\"hi\"}\n").unwrap();
+        assert_eq!(req["text"], "hi");
+        assert!(parse_rpc("{\"cmd\":\"watch\"}").is_err());
+        assert!(parse_rpc("{\"to\":\"npub1x\"}").is_err());
+        assert!(parse_rpc("[\"send\"]").is_err());
+        assert!(parse_rpc("not json").is_err());
     }
 }

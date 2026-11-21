@@ -52,7 +52,14 @@ enum Change {
 pub struct App {
     keys: Keys,
     me: PublicKey,
+    /// Connections to your own relays (`inbox_relays` and `relays`). They
+    /// subscribe to gift wraps addressed to you and are the only ones that
+    /// answer NIP-42 AUTH with your key. They never look anyone up and never
+    /// carry messages to other people.
     client: Client,
+    /// Connections for lookups (profiles, other people's relay lists). They
+    /// never authenticate and never ask for anything addressed to you.
+    lookup: Client,
     store: Mutex<Store>,
     cfg: Config,
     changed: broadcast::Sender<Change>,
@@ -81,8 +88,14 @@ pub async fn run() -> anyhow::Result<()> {
     let client = Client::builder()
         .authenticator(SignerAuthenticator::new(keys.clone()))
         .build();
-    for url in cfg.all_relays() {
+    for url in cfg.reader_relays() {
         if let Err(e) = client.add_relay(url.as_str()).await {
+            eprintln!("omessaged: skipping relay {url}: {e}");
+        }
+    }
+    let lookup = Client::default();
+    for url in cfg.lookup_relays() {
+        if let Err(e) = lookup.add_relay(url.as_str()).await {
             eprintln!("omessaged: skipping relay {url}: {e}");
         }
     }
@@ -92,6 +105,7 @@ pub async fn run() -> anyhow::Result<()> {
         keys,
         me,
         client,
+        lookup,
         store: Mutex::new(store),
         cfg,
         changed,
@@ -119,7 +133,10 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    app.client.connect().and_wait(Duration::from_secs(8)).await;
+    tokio::join!(
+        app.client.connect().and_wait(Duration::from_secs(8)),
+        app.lookup.connect().and_wait(Duration::from_secs(8)),
+    );
     app.subscribe().await;
     {
         let app = app.clone();
@@ -144,7 +161,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
     let _ = std::fs::remove_file(&sock);
-    app.client.shutdown().await;
+    tokio::join!(app.client.shutdown(), app.lookup.shutdown());
     Ok(())
 }
 
@@ -198,19 +215,28 @@ impl App {
             Ok(e) => e,
             Err(e) => return eprintln!("omessaged: could not sign inbox list: {e}"),
         };
-        let targets = self.cfg.all_relays();
-        match self
-            .client
-            .send_event(&event)
-            .to(targets.iter().map(|s| s.as_str()))
-            .await
-        {
-            Ok(out) => eprintln!(
-                "omessaged: published kind 10050 inbox list to {} relays",
-                out.success.len()
-            ),
+        // Your own relays get it over your (authenticated) connections;
+        // discovery relays get it from a one-off connection that doesn't
+        // authenticate, so the lookup connections never carry your key.
+        let mine = self.cfg.reader_relays();
+        let others: Vec<String> = self
+            .cfg
+            .all_relays()
+            .into_iter()
+            .filter(|r| !mine.contains(r))
+            .collect();
+        let mut ok = 0;
+        match self.client.send_event(&event).to(mine.iter().map(|s| s.as_str())).await {
+            Ok(out) => ok += out.success.len(),
             Err(e) => eprintln!("omessaged: inbox list publish failed: {e}"),
         }
+        if !others.is_empty() {
+            match publish_once(&event, &others, None).await {
+                Ok((accepted, _)) => ok += accepted.len(),
+                Err(e) => eprintln!("omessaged: inbox list publish failed: {e}"),
+            }
+        }
+        eprintln!("omessaged: published kind 10050 inbox list to {ok} relays");
     }
 
     /// Every 5 s: watch relay status. Every minute: remember we were
@@ -246,10 +272,26 @@ impl App {
     }
 
     async fn relay_signature(&self) -> String {
-        let relays = self.client.relays().await;
-        let mut v: Vec<String> = relays.iter().map(|(u, r)| format!("{u}={}", r.status())).collect();
-        v.sort();
+        let v: Vec<String> = self
+            .relay_statuses()
+            .await
+            .iter()
+            .map(|(u, s)| format!("{u}={s}"))
+            .collect();
         v.join(",")
+    }
+
+    /// Every relay with its status, sorted by URL. A relay in both pools
+    /// shows the status of your own (reading) connection.
+    async fn relay_statuses(&self) -> Vec<(String, RelayStatus)> {
+        let mut map: std::collections::BTreeMap<String, RelayStatus> = std::collections::BTreeMap::new();
+        for (u, r) in self.lookup.relays().await {
+            map.insert(u.to_string(), r.status());
+        }
+        for (u, r) in self.client.relays().await {
+            map.insert(u.to_string(), r.status());
+        }
+        map.into_iter().collect()
     }
 
     async fn fetch_profiles(&self) {
@@ -264,7 +306,7 @@ impl App {
             return;
         }
         let filter = Filter::new().kind(Kind::Metadata).authors(missing.clone());
-        let events = match self.client.fetch_events(filter).timeout(Duration::from_secs(6)).await {
+        let events = match self.lookup.fetch_events(filter).timeout(Duration::from_secs(6)).await {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -311,7 +353,7 @@ impl App {
                 let _ = self.db().mark_wrap_seen(&wrap_id);
                 if let Some(incoming) = stored {
                     if let Some((title, body)) = incoming.notice {
-                        notify(&title, &body);
+                        tokio::spawn(async move { notify(&title, &body).await });
                     }
                     self.notify_peer(&incoming.peer);
                 }
@@ -420,7 +462,7 @@ impl App {
         }
         let mut relays: Vec<String> = Vec::new();
         let filter = Filter::new().kind(Kind::InboxRelays).author(*pk).limit(5);
-        if let Ok(events) = self.client.fetch_events(filter).timeout(Duration::from_secs(6)).await
+        if let Ok(events) = self.lookup.fetch_events(filter).timeout(Duration::from_secs(6)).await
             && let Some(ev) = events.iter().max_by_key(|e| e.created_at)
         {
             relays = nip17::extract_relay_list(ev).map(|u| u.to_string()).collect();
@@ -428,7 +470,7 @@ impl App {
         if relays.is_empty() {
             // Fall back to the NIP-65 read relays, then to our own relays.
             let filter = Filter::new().kind(Kind::RelayList).author(*pk).limit(5);
-            if let Ok(events) = self.client.fetch_events(filter).timeout(Duration::from_secs(6)).await
+            if let Ok(events) = self.lookup.fetch_events(filter).timeout(Duration::from_secs(6)).await
                 && let Some(ev) = events.iter().max_by_key(|e| e.created_at)
             {
                 relays = nip65::extract_relay_list(ev)
@@ -444,21 +486,6 @@ impl App {
         }
         let _ = self.db().cache_inbox(&hex, &relays);
         relays
-    }
-
-    async fn ensure_relays(&self, urls: &[String]) -> Vec<String> {
-        let mut ok = Vec::new();
-        for url in urls {
-            if self.client.add_relay(url.as_str()).await.is_err() {
-                continue;
-            }
-            let _ = self
-                .client
-                .try_connect_relay(url.as_str(), Duration::from_secs(5))
-                .await;
-            ok.push(url.clone());
-        }
-        ok
     }
 
     pub async fn send(&self, to: &str, text: &str) -> anyhow::Result<Value> {
@@ -540,13 +567,15 @@ impl App {
         self.notify_peer(&pk);
         let (accepted, errors) = match result {
             Ok((accepted, errors, self_wrap)) => {
-                // Copy for our own other devices / restore; best effort.
-                let mine: Vec<String> = self.ensure_relays(&self.cfg.inbox_relays).await;
-                let _ = self
-                    .client
-                    .send_event(&self_wrap)
-                    .to(mine.iter().map(|s| s.as_str()))
-                    .await;
+                // Our own copy (for restore) goes to our inbox relays over our
+                // own connections, after a random delay so a relay that gets
+                // both wraps can't pair them up by timing alone. Best effort.
+                let client = self.client.clone();
+                let mine = self.cfg.inbox_relays.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(self_copy_delay_secs())).await;
+                    let _ = client.send_event(&self_wrap).to(mine.iter().map(|s| s.as_str())).await;
+                });
                 (accepted, errors)
             }
             Err(e) => (vec![], vec![e.to_string()]),
@@ -569,14 +598,10 @@ impl App {
         let _ = self.db().mark_wrap_seen(&self_wrap.id.to_hex());
 
         let targets = self.inbox_relays_for(&pk).await;
-        let targets = self.ensure_relays(&targets).await;
-        let out = self
-            .client
-            .send_event(&to_wrap)
-            .to(targets.iter().map(|s| s.as_str()))
-            .await?;
-        let accepted: Vec<String> = out.success.keys().map(|u| u.to_string()).collect();
-        let errors: Vec<String> = out.failed.iter().map(|(u, e)| format!("{u}: {e}")).collect();
+        // A fresh connection per message: if a relay asks for NIP-42 AUTH it
+        // gets a throwaway key, never yours, so it can't tie this wrap (and
+        // its recipient) to you.
+        let (accepted, errors) = publish_once(&to_wrap, &targets, Some(Keys::generate())).await?;
         Ok((accepted, errors, self_wrap))
     }
 
@@ -610,13 +635,12 @@ impl App {
     }
 
     async fn state(&self, kind: &str) -> Value {
-        let relays = self.client.relays().await;
-        let mut list: Vec<Value> = relays
+        let relays = self.relay_statuses().await;
+        let list: Vec<Value> = relays
             .iter()
-            .map(|(u, r)| json!({"url": u.to_string(), "status": r.status().to_string()}))
+            .map(|(u, s)| json!({"url": u, "status": s.to_string()}))
             .collect();
-        list.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));
-        let connected = relays.values().filter(|r| r.status() == RelayStatus::Connected).count();
+        let connected = relays.iter().filter(|(_, s)| *s == RelayStatus::Connected).count();
         let st = self.db();
         json!({
             "type": kind,
@@ -768,25 +792,91 @@ fn clean_name(s: &str) -> String {
         .collect()
 }
 
-fn notify(title: &str, body: &str) {
+/// Show a desktop notification through the org.freedesktop.Notifications
+/// D-Bus interface. Talking to the bus directly keeps the sender's name and
+/// message text out of any command line (`notify-send` would put them in
+/// its arguments, which other local users can list).
+async fn notify(title: &str, body: &str) {
+    static BUS: tokio::sync::Mutex<Option<zbus::Connection>> = tokio::sync::Mutex::const_new(None);
     let title = notify_text(title, 64);
     let body = notify_text(body, 240);
-    // `--` ends option parsing: a sender-chosen name or message that starts
-    // with `-` must never be read as a notify-send flag.
-    let _ = std::process::Command::new("notify-send")
-        .args([
-            "-a",
-            "Omessage",
-            "-i",
-            "mail-message-new",
-            "-c",
-            "im.received",
-            "--",
-            &title,
-            &body,
-        ])
-        .spawn()
-        .map(|mut c| std::thread::spawn(move || c.wait()));
+    let mut bus = BUS.lock().await;
+    // One retry with a fresh connection, in case the bus restarted.
+    for _ in 0..2 {
+        if bus.is_none() {
+            match zbus::Connection::session().await {
+                Ok(c) => *bus = Some(c),
+                Err(e) => return eprintln!("omessaged: no D-Bus session for notifications: {e}"),
+            }
+        }
+        let Some(conn) = bus.as_ref() else { return };
+        let mut hints: std::collections::HashMap<&str, zbus::Variant<'_>> = std::collections::HashMap::new();
+        hints.insert("category", zbus::Variant::from("im.received"));
+        let sent = conn
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "Notify",
+                &(
+                    "Omessage",
+                    0u32,
+                    "mail-message-new",
+                    title.as_str(),
+                    body.as_str(),
+                    Vec::<&str>::new(),
+                    hints,
+                    -1i32,
+                ),
+            )
+            .await;
+        match sent {
+            Ok(_) => return,
+            Err(e) => {
+                eprintln!("omessaged: notification failed: {e}");
+                *bus = None;
+            }
+        }
+    }
+}
+
+/// Publish one event to `targets` from a short-lived pool of its own, so the
+/// connections carry nothing else. `auth`: the key used if a relay asks for
+/// NIP-42 AUTH (`None`: never authenticate). Returns (relays that accepted,
+/// per-relay errors).
+async fn publish_once(
+    event: &Event,
+    targets: &[String],
+    auth: Option<Keys>,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let client = match auth {
+        Some(k) => Client::builder().authenticator(SignerAuthenticator::new(k)).build(),
+        None => Client::default(),
+    };
+    let mut added = Vec::new();
+    for url in targets {
+        if client.add_relay(url.as_str()).await.is_ok() {
+            added.push(url.clone());
+        }
+    }
+    if added.is_empty() {
+        anyhow::bail!("no usable relays");
+    }
+    client.connect().and_wait(Duration::from_secs(10)).await;
+    let out = client.send_event(event).to(added.iter().map(|s| s.as_str())).await;
+    tokio::spawn(async move { client.shutdown().await });
+    let out = out?;
+    let accepted: Vec<String> = out.success.keys().map(|u| u.to_string()).collect();
+    let errors: Vec<String> = out.failed.iter().map(|(u, e)| format!("{u}: {e}")).collect();
+    Ok((accepted, errors))
+}
+
+/// Seconds to wait before publishing our own copy of a sent message.
+fn self_copy_delay_secs() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    // Randomly keyed SipHash of nothing: plenty random for a delay.
+    let r = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    5 + r % 56
 }
 
 /// Make untrusted text safe for a notification: drop control characters,
@@ -803,6 +893,35 @@ fn notify_text(s: &str, max_chars: usize) -> String {
         }
     }
     out
+}
+
+/// curl arguments for a NIP-05 lookup. `-q` must come first: it stops curl
+/// from reading ~/.curlrc, which could turn on redirects or change where the
+/// answer comes from. NIP-05 fetchers must ignore redirects, so they're
+/// refused outright, and the reply size is capped. The URL itself is read
+/// from stdin (`-K -`, see [`nip05_curl_config`]).
+fn nip05_curl_args() -> [&'static str; 12] {
+    [
+        "-q",
+        "-fsS",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "0",
+        "--max-time",
+        "8",
+        "--max-filesize",
+        "65536",
+        "-K",
+        "-",
+    ]
+}
+
+/// The curl config line carrying the URL. `resolve` only builds URLs from
+/// ASCII letters, digits and `.-_`, so nothing here needs escaping.
+fn nip05_curl_config(url: &str) -> String {
+    debug_assert!(!url.contains(['"', '\\', '\n']));
+    format!("url = \"{url}\"\n")
 }
 
 /// Accept npub, nprofile, hex, `nostr:` URIs and NIP-05 identifiers.
@@ -830,21 +949,19 @@ pub async fn resolve(who: &str) -> anyhow::Result<(PublicKey, Option<String>)> {
             anyhow::bail!("not a valid NIP-05 address: {who}");
         }
         let url = format!("https://{domain}/.well-known/nostr.json?name={name}");
-        let out = tokio::process::Command::new("curl")
-            // NIP-05: fetchers must ignore redirects, so no -L. Cap the reply size.
-            .args([
-                "-fsS",
-                "--proto",
-                "=https",
-                "--max-time",
-                "8",
-                "--max-filesize",
-                "65536",
-                "--",
-                &url,
-            ])
-            .output()
-            .await?;
+        // The URL goes to curl on stdin (`-K -`), so the address being
+        // looked up never shows up in the process list.
+        let mut child = tokio::process::Command::new("curl")
+            .args(nip05_curl_args())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(nip05_curl_config(&url).as_bytes()).await?;
+        }
+        let out = child.wait_with_output().await?;
         if !out.status.success() {
             anyhow::bail!("NIP-05 lookup failed for {who}");
         }
@@ -877,6 +994,32 @@ mod tests {
         );
         assert_eq!(notify_text("line1\nline2", 100), "line1\nline2");
         assert_eq!(notify_text("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn nip05_curl_ignores_curlrc_and_redirects() {
+        let args = nip05_curl_args();
+        assert_eq!(args[0], "-q", "-q only works as the first argument");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("http") || *a == "-L" || *a == "--location")
+        );
+        let i = args.iter().position(|a| *a == "--max-redirs").unwrap();
+        assert_eq!(args[i + 1], "0");
+        assert_eq!(&args[args.len() - 2..], ["-K", "-"]);
+        assert_eq!(
+            nip05_curl_config("https://example.com/.well-known/nostr.json?name=bob"),
+            "url = \"https://example.com/.well-known/nostr.json?name=bob\"\n"
+        );
+    }
+
+    #[test]
+    fn self_copy_delay_is_bounded() {
+        for _ in 0..100 {
+            let d = self_copy_delay_secs();
+            assert!((5..=60).contains(&d));
+        }
     }
 
     #[test]

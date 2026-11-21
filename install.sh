@@ -5,9 +5,13 @@
 # ~/.config/systemd/user/omessaged.service, then enables the user service.
 # It does not touch any Omarchy configuration. No root access is needed.
 #
-# By default the helper is built from ./helper with cargo (a recent stable Rust).
-# Set OMESSAGE_HELPER_BIN=/path/to/omessaged to install a binary you built
-# yourself instead.
+# By default the helper is built from ./helper with cargo (Rust 1.89+).
+# To install a prebuilt binary instead, set OMESSAGE_HELPER_BIN=/path/to/omessaged
+# and OMESSAGE_HELPER_SHA256=<its sha256>; the install stops if they don't match.
+#
+# The unit file is regenerated on every install. Put local changes in a
+# drop-in (systemctl --user edit omessaged); if the unit file itself was
+# edited, it is backed up before being replaced.
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,12 +39,39 @@ if [[ -z $src_bin ]]; then
   cargo build --release --locked --manifest-path "$PLUGIN_DIR/helper/Cargo.toml"
   src_bin="$CARGO_TARGET_DIR/release/omessaged"
 fi
-[[ -x $src_bin ]] || die "helper binary not found or not executable: $src_bin"
+[[ -f $src_bin ]] || die "helper binary not found: $src_bin"
 
-say "Installing helper to $TARGET_BIN"
 mkdir -p "$BIN_DIR"
-install -m 0755 "$src_bin" "$TARGET_BIN.new"
-mv -f "$TARGET_BIN.new" "$TARGET_BIN"
+# Check the copy we will install, not the original, so the file can't change
+# between the check and the install.
+staged="$TARGET_BIN.new"
+trap 'rm -f "$staged"' EXIT
+install -m 0755 "$src_bin" "$staged"
+
+want_sha="${OMESSAGE_HELPER_SHA256:-}"
+if [[ -n $want_sha ]]; then
+  want_sha=${want_sha%% *}
+  want_sha=${want_sha,,}
+  [[ $want_sha =~ ^[0-9a-f]{64}$ ]] || die "OMESSAGE_HELPER_SHA256 is not a sha256 hash"
+  have_sha=$(sha256sum "$staged" | cut -d' ' -f1)
+  [[ $have_sha == "$want_sha" ]] ||
+    die "checksum mismatch for $src_bin (expected $want_sha, got $have_sha); nothing was installed"
+  say "Checksum OK ($have_sha)"
+elif [[ -n ${OMESSAGE_HELPER_BIN:-} ]]; then
+  say "Warning: OMESSAGE_HELPER_SHA256 is not set, so the binary's checksum was not verified."
+fi
+
+# Make sure it runs and is really omessaged before replacing anything.
+version=$("$staged" --version 2>/dev/null) || die "$src_bin does not run on this system; nothing was installed"
+[[ $version == "omessaged "* ]] || die "$src_bin is not omessaged; nothing was installed"
+want_version=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/manifest.json" | head -n1)
+if [[ -n $want_version && $version != "omessaged $want_version" ]]; then
+  say "Warning: installing $version, but the plugin is version $want_version."
+fi
+
+say "Installing $version to $TARGET_BIN"
+mv -f "$staged" "$TARGET_BIN"
+trap - EXIT
 
 say "Installing user service $UNIT"
 mkdir -p "$UNIT_DIR"
@@ -51,6 +82,12 @@ unit_bin=${unit_bin//\"/\\\"}
 unit_bin=\"${unit_bin//%/%%}\"
 sed_bin=$(printf '%s' "$unit_bin" | sed 's/[\\&|]/\\&/g')
 sed "s|@OMESSAGED@|$sed_bin|" "$PLUGIN_DIR/systemd/omessaged.service" >"$UNIT.new"
+if [[ -f $UNIT ]] && ! cmp -s "$UNIT" "$UNIT.new"; then
+  backup="$UNIT.bak-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$UNIT" "$backup"
+  say "Your edited $UNIT was saved to $backup."
+  say "Put local changes in a drop-in instead (systemctl --user edit omessaged); drop-ins survive reinstalls."
+fi
 mv -f "$UNIT.new" "$UNIT"
 
 systemctl --user daemon-reload
