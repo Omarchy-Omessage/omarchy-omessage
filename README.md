@@ -47,8 +47,8 @@ omarchy plugin add https://github.com/Omarchy-Omessage/omarchy-omessage --enable
 `omessaged`, which holds your key, talks to the relays and stores messages.
 Pick one option:
 
-- **Build it from source** (needs Rust 1.89 or newer, e.g. `sudo pacman -S rust`;
-  the first build takes a few minutes):
+- **Build it from source** (needs Rust 1.89 or newer, from the Arch `rust`
+  package; the first build takes a few minutes):
 
   ```bash
   ~/.config/omarchy/plugins/io.github.omarchy-omessage.omessage/install.sh
@@ -207,9 +207,10 @@ identity again.
 
 ## Build from source
 
+From the plugin directory (or a checkout of this repository):
+
 ```bash
-git clone https://github.com/Omarchy-Omessage/omarchy-omessage
-cd omarchy-omessage/helper
+cd helper
 cargo build --release --locked     # Rust 1.89+
 cargo test --release --locked
 ```
