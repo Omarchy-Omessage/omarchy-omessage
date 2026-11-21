@@ -1,0 +1,16 @@
+[Unit]
+Description=Omessage helper (private Nostr messages for Omarchy)
+Documentation=https://github.com/Omarchy-Omessage/omarchy-omessage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@OMESSAGED@ daemon
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

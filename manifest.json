@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.omarchy-omessage.omessage",
+  "name": "Omessage",
+  "version": "0.1.0",
+  "author": "Bryan Hayes",
+  "license": "MIT",
+  "description": "iMessage-style private messenger for Omarchy: per-device Nostr identity, end-to-end encrypted NIP-17 DMs, unread count in the bar and a chat panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omessage",
+    "description": "Private Nostr messages with an unread count and chat panel",
+    "category": "Communication",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
